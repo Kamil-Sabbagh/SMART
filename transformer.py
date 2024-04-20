@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+
+state_embed_dim = 20
+action_embed_dim = 20
 
 class StateActionEmbedding(nn.Module):
     def __init__(self, state_dim, action_dim, embed_dim):
@@ -45,17 +49,31 @@ class TransformerPredictor(nn.Module):
 
 def train_model(model, dataloader, optimizer, loss_fn, epochs=10, save_path=None):
     model.train()
-    for epoch in range(epochs):
+    for epoch in tqdm(range(epochs), desc="Epochs"):
         total_loss = 0
-        for state_batch, action_batch, target_action_batch in dataloader:
+        for i, (state_batch, action_batch, target_action_batch) in enumerate(dataloader):
+            print(f"\nBatch {i+1}")
+            print(f"State batch shape: {state_batch.shape}")  # [batch_size, seq_length, state_dim]
+            print(f"Action batch shape: {action_batch.shape}")  # [batch_size, seq_length, action_dim]
+            print(f"Target action batch shape: {target_action_batch.shape}")  # [batch_size, seq_length, num_actions]
+
             optimizer.zero_grad()
             action_predictions = model(state_batch, action_batch)
-            loss = loss_fn(action_predictions, target_action_batch[:, -1, :])
+            print(f"Action predictions shape: {action_predictions.shape}")  # [batch_size, num_actions]
+
+            # Select the last timestep's target actions for loss calculation
+            targets = target_action_batch[:, -1, :]
+            print(f"Targets for loss calculation shape: {targets.shape}")  # [batch_size, num_actions]
+
+            loss = loss_fn(action_predictions, targets)
+            print(f"Loss: {loss.item()}")
+
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
-        print(f'Epoch {epoch+1}, Loss: {total_loss / len(dataloader)}')
+        average_loss = total_loss / len(dataloader)
+        print(f'\nEpoch {epoch+1}, Average Loss: {average_loss}')
 
         if save_path:
             torch.save({
@@ -73,13 +91,35 @@ def load_model(model, optimizer, load_path):
     loss = checkpoint['loss']
     return start_epoch, loss
 
+# Define dimensions and sequence length
+state_dim = 600
+action_dim = 100
+num_actions = 3
+seq_length = 10  # Arbitrary sequence length
+batch_size = 32  # Define the batch size for DataLoader
+num_samples = 100  # Number of samples in the dataset
+num_heads = 2
+num_layers = 2
+
 # Example initialization and usage
-model = TransformerPredictor(embed_dim=128, num_heads=8, num_layers=3, num_actions=3)
+model = TransformerPredictor(state_embed_dim=state_embed_dim, action_embed_dim=action_embed_dim, num_heads=num_heads, num_layers=num_layers, num_actions=num_actions)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 loss_fn = torch.nn.MSELoss()
 
+
+# Generate random data for states, actions, and target actions
+states = torch.randn(num_samples, seq_length, state_dim)
+actions = torch.randn(num_samples, seq_length, action_dim)
+target_actions = torch.randn(num_samples, seq_length, num_actions)
+
+# Create TensorDataset
+dataset = TensorDataset(states, actions, target_actions)
+
+# Create DataLoader
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
 # Assuming dataset and DataLoader setup here
-# train_model(model, dataloader, optimizer, loss_fn, epochs=10, save_path='model_checkpoint.pth')
+train_model(model, dataloader, optimizer, loss_fn, epochs=10, save_path='model_checkpoint.pth')
 
 # Example loading (you need to create the optimizer before calling this)
 # start_epoch, loss = load_model(model, optimizer, 'model_checkpoint.pth')
