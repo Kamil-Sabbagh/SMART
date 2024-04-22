@@ -29,21 +29,29 @@ class TransformerPredictor(nn.Module):
         super(TransformerPredictor, self).__init__()
         self.embedding = StateActionEmbedding(state_dim=10*60, action_dim=10*10, embed_dim=state_embed_dim)
         self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=state_embed_dim + action_embed_dim, nhead=num_heads),
+            nn.TransformerEncoderLayer(d_model=state_embed_dim , nhead=num_heads),
             num_layers=num_layers
         )
-        self.output_layer = nn.Linear(state_embed_dim + action_embed_dim, num_actions)
+        self.output_layer = nn.Linear(state_embed_dim, num_actions)
 
     def forward(self, states, actions):
         seq_length = states.shape[1]
         embedded = torch.zeros(states.shape[0], seq_length, state_embed_dim + action_embed_dim, device=states.device)
         
-        for i in range(seq_length):
-            state_embedded = self.embedding.forward_state(states[:, i, :])
-            action_embedded = self.embedding.forward_action(actions[:, i, :])
-            embedded[:, i, :] = torch.cat((state_embedded, action_embedded), dim=-1)
+        # for i in range(seq_length):
+        #     state_embedded = self.embedding.forward_state(states[:, i, :])
+        #     action_embedded = self.embedding.forward_action(actions[:, i, :])
+        #     embedded[:, i, :] = torch.cat((state_embedded, action_embedded), dim=-1)
         
-        transformer_output = self.transformer(embedded)
+
+        embed2= torch.zeros(states.shape[0], seq_length*2, state_embed_dim, device=states.device)
+
+        for i in range(seq_length):
+            print( i*2, (i*2)+1)
+            embed2[:, i*2, :] = self.embedding.forward_state(states[:, i, :])
+            embed2[:, (i*2)+1, :] = self.embedding.forward_action(actions[:, i, :])
+
+        transformer_output = self.transformer(embed2[:-1])
         action_predictions = self.output_layer(transformer_output[:, -1, :])
         return action_predictions
 
@@ -65,7 +73,7 @@ def train_model(model, dataloader, optimizer, loss_fn, epochs=10, save_path=None
             targets = target_action_batch[:, -1, :]
             print(f"Targets for loss calculation shape: {targets.shape}")  # [batch_size, num_actions]
 
-            loss = loss_fn(action_predictions, targets)
+            loss = loss_fn(action_predictions, targets[:-1])
             print(f"Loss: {loss.item()}")
 
             loss.backward()
@@ -94,8 +102,8 @@ def load_model(model, optimizer, load_path):
 # Define dimensions and sequence length
 state_dim = 600
 action_dim = 100
-num_actions = 3
-seq_length = 10  # Arbitrary sequence length
+num_actions = 1
+seq_length = state_embed_dim-1  # Arbitrary sequence length
 batch_size = 32  # Define the batch size for DataLoader
 num_samples = 100  # Number of samples in the dataset
 num_heads = 2
