@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
+from torchviz import make_dot
+from graphviz import Digraph
+
+
+
 
 state_embed_dim = 20
 action_embed_dim = 20
@@ -128,6 +133,28 @@ dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 # Assuming dataset and DataLoader setup here
 train_model(model, dataloader, optimizer, loss_fn, epochs=10, save_path='model_checkpoint.pth')
+
+# Use torchviz to create a dot graph of the model.
+states = torch.randn(1, 10, 600)
+actions = torch.randn(1, 10, 100)
+output = model(states, actions)
+
+# Create a simplified graph
+graph = Digraph()
+graph.node("Input", "Input (States & Actions)")
+graph.node("Embedding", "Embedding Layer")
+graph.node("Transformer", "Transformer Encoder")
+graph.node("Output", "Output Layer")
+graph.node("Pred", "Predictions")
+
+graph.edge("Input", "Embedding")
+graph.edge("Embedding", "Transformer")
+graph.edge("Transformer", "Output")
+graph.edge("Output", "Pred")
+
+# Render the simplified graph
+graph.render('simplified_transformer_model', format='png')
+
 
 # Example loading (you need to create the optimizer before calling this)
 # start_epoch, loss = load_model(model, optimizer, 'model_checkpoint.pth')
