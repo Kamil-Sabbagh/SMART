@@ -45,6 +45,52 @@ class MaskedActionPredictionHead(nn.Module):
         predictions = self.output_layer(attn_output)
 
         return predictions
+    
+
+class ForwardDynamicHead(nn.Module):
+    def __init__(self, embed_dim, output_dim, num_heads):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
+        self.output_layer = nn.Linear(embed_dim, output_dim)
+
+    def forward(self, x, context_indices, target_index):
+        # Assume x has already been transposed appropriately before calling
+        # x should be [seq_length, batch_size, embed_dim], seq_length should be 3 in this case
+
+        # Apply attention where the last position is the target, and the first two are context
+        target = x[target_index, :].unsqueeze(0)  # Add seq_len dimension back
+        context = x[context_indices, :]
+
+        # Attention operation
+        attn_output, _ = self.attention(target, context, context)
+
+        # Output processing
+        predictions = self.output_layer(attn_output.squeeze(0))  # Remove seq_len dimension for linear layer
+
+        return predictions
+
+    
+class InverseDynamicHead(nn.Module):
+    def __init__(self, embed_dim, output_dim, num_heads):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
+        self.output_layer = nn.Linear(embed_dim, output_dim)
+
+    def forward(self, x, context_indices, target_index):
+        # Assume x has already been transposed appropriately before calling
+        # x should be [seq_length, batch_size, embed_dim], seq_length should be 3 in this case
+
+        # Apply attention where the last position is the target, and the first two are context
+        target = x[target_index, :].unsqueeze(0)  # Add seq_len dimension back
+        context = x[context_indices, :]
+
+        # Attention operation
+        attn_output, _ = self.attention(target, context, context)
+
+        # Output processing
+        predictions = self.output_layer(attn_output.squeeze(0))  # Remove seq_len dimension for linear layer
+
+        return predictions
 
 
 class TransformerPredictor(nn.Module):
@@ -56,8 +102,10 @@ class TransformerPredictor(nn.Module):
             num_layers=num_layers
         )
         self.output_layer = nn.Linear(state_embed_dim, action_dim)
-        self.dynamic_prediction = nn.Linear(state_embed_dim * 2, state_dim)
-        self.inverse_prediction = nn.Linear(state_embed_dim * 2, action_dim)
+        #self.dynamic_prediction = nn.Linear(state_embed_dim * 2, state_dim)
+        #self.inverse_prediction = nn.Linear(state_embed_dim * 2, action_dim)
+        self.forward_dynamic_head = ForwardDynamicHead(state_embed_dim, state_dim, num_heads)
+        self.inverse_dynamic_head = InverseDynamicHead(state_embed_dim, action_dim, num_heads)
         self.masked_action_head = MaskedActionPredictionHead(state_embed_dim, action_dim, num_heads)
 
     def forward(self, states, actions):
@@ -72,8 +120,23 @@ class TransformerPredictor(nn.Module):
         transformer_output = self.transformer(embed)
         
         action_prediction = self.output_layer(transformer_output[:, -1, :])  # Example for last action
-        forward_prediction = self.dynamic_prediction(torch.cat((transformer_output[:, -2, :], transformer_output[:, -1, :]), dim=-1))
-        inverse_prediction = self.inverse_prediction(torch.cat((transformer_output[:, -2, :], transformer_output[:, 0, :]), dim=-1))
+        #forward_prediction = self.dynamic_prediction(torch.cat((transformer_output[:, -2, :], transformer_output[:, -1, :]), dim=-1))
+        #inverse_prediction = self.inverse_prediction(torch.cat((transformer_output[:, -2, :], transformer_output[:, 0, :]), dim=-1))
+
+        Dynamic_forward_predictions = torch.zeros(states.shape[1]-1, states.shape[0], state_dim, device=states.device)
+        Dynamic_inverse_predictions = torch.zeros(states.shape[1]-1, states.shape[0], action_dim, device=states.device)
+        counter = 0 
+        for i in range(2, seq_length*2, 2):
+            embed_slice = embed[:, [i-2, i-1, i], :].transpose(0, 1)  # Transpose to [3, batch_size, embed_dim]
+            Dynamic_forward_predictions[counter] = self.forward_dynamic_head(embed_slice, [0, 1], 2)
+            counter += 1
+
+        counter = 0
+        for i in range(2, seq_length*2, 2):
+            embed_slice = embed[:, [i-2, i-1, i], :].transpose(0, 1)  # Transpose to [3, batch_size, embed_dim]
+            counter += 1
+
+
 
         # Calculate indices for actions and concatenate with state indices
 
@@ -85,7 +148,27 @@ class TransformerPredictor(nn.Module):
         # Use these indices to select the corresponding embeddings
         masked_action_predictions = self.masked_action_head(embed, unmasked, (mask_indices_actions * 2) + 1)
 
-        return action_prediction, forward_prediction, inverse_prediction, masked_action_predictions, mask_indices_states, mask_indices_actions
+        return action_prediction, Dynamic_forward_predictions, Dynamic_inverse_predictions, masked_action_predictions, mask_indices_states, mask_indices_actions
+
+    def random_mask(self, states, actions):
+        seq_length = states.shape[1]
+        mask_size_states = seq_length // 2 + 1
+        mask_size_actions = seq_length // 2 - 1
+
+        mask_indices_states = torch.randperm(seq_length)[:mask_size_states]
+        mask_indices_actions = torch.randperm(seq_length)[:mask_size_actions]
+
+        return mask_indices_states, mask_indices_actions
+
+    def random_mask(self, states, actions):
+        seq_length = states.shape[1]
+        mask_size_states = seq_length // 2 + 1
+        mask_size_actions = seq_length // 2 - 1
+
+        mask_indices_states = torch.randperm(seq_length)[:mask_size_states]
+        mask_indices_actions = torch.randperm(seq_length)[:mask_size_actions]
+
+        return mask_indices_states, mask_indices_actions
 
     def random_mask(self, states, actions):
         seq_length = states.shape[1]
@@ -109,10 +192,10 @@ def train_model(model, dataloader, optimizer, loss_fn, epochs=10, save_path=None
             action_targets = action_batch[:, -1, :]
             action_loss = loss_fn(action_predictions, action_targets)
 
-            forward_targets = state_batch[:, 2, :]
+            forward_targets = state_batch[:,:-1:,].transpose(0, 1)     
             forward_loss = loss_fn(forward_predictions, forward_targets)
 
-            inverse_targets = action_batch[:, 1, :]
+            inverse_targets = action_batch[:, :-1, :].transpose(0, 1) 
             inverse_loss = loss_fn(inverse_predictions, inverse_targets)
             
             # Gather using created indices
