@@ -1,251 +1,212 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
-from torchviz import make_dot
-from graphviz import Digraph
+from torch.utils.tensorboard import SummaryWriter
+import os
 
-import torch
-import torch.nn as nn
+from data_reader import DataLoader as CustomDataLoader
+from model import TransformerPredictor
 
-class StateActionEmbedding(nn.Module):
-    def __init__(self, state_dim, action_dim, embed_dim):
-        super().__init__()
-        self.state_embedding = nn.Linear(state_dim, embed_dim)
-        self.action_embedding = nn.Linear(action_dim, embed_dim)
+def plot_metrics(metrics, steps, save_path='plots'):
+    """
+    Plots training metrics and saves the plots as images.
 
-    def forward_state(self, state):
-        return self.state_embedding(state)
+    Args:
+        metrics (dict): A dictionary containing lists of metric values.
+        steps (list): A list of step indices corresponding to the metric values.
+        save_path (str): The directory path where the plots will be saved.
+    """
+    import matplotlib.pyplot as plt  # Import here to avoid unnecessary import if the function is not used
 
-    def forward_action(self, action):
-        return self.action_embedding(action)
+    plt.figure(figsize=(12, 8))
 
-class MaskedActionPredictionHead(nn.Module):
-    def __init__(self, embed_dim, action_dim, num_heads):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
-        self.output_layer = nn.Linear(embed_dim, action_dim)
+    # Plot Accuracy
+    plt.subplot(2, 2, 1)
+    plt.plot(steps, metrics['accuracy'], label='Accuracy')
+    plt.xlabel('Steps')
+    plt.ylabel('Accuracy')
+    plt.legend()
 
-    def forward(self, x, unmasked_indices, masked_action_indices):
-        # Transpose x to match [seq_length, batch_size, embed_dim]
-        x = x.transpose(0, 1)  # Now x is [seq_length*2, batch_size, embed_dim]
+    # Plot Forward Loss
+    plt.subplot(2, 2, 2)
+    plt.plot(steps, metrics['forward_loss'], label='Forward Loss')
+    plt.xlabel('Steps')
+    plt.ylabel('Loss')
+    plt.legend()
 
-        # Select only the unmasked and masked parts of the input sequence
-        unmasked_inputs = x[unmasked_indices, :]
-        masked_action_inputs = x[masked_action_indices, :]
+    # Plot Inverse Loss
+    plt.subplot(2, 2, 3)
+    plt.plot(steps, metrics['inverse_loss'], label='Inverse Loss')
+    plt.xlabel('Steps')
+    plt.ylabel('Loss')
+    plt.legend()
 
-        # Apply attention
-        attn_output, _ = self.attention(masked_action_inputs, unmasked_inputs, unmasked_inputs)
+    # Ensure plots are neatly organized and save to the specified path
+    plt.tight_layout()
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    plt.savefig(f'{save_path}/metrics_step_{steps[-1]}.png')
+    plt.close()
 
-        # Transpose the output back to [batch_size, seq_length, embed_dim] for the linear layer
-        attn_output = attn_output.transpose(0, 1)  # Back to [batch_size, seq_length, embed_dim]
+def train_model(model, custom_dataloader, optimizer, action_loss_fn, state_loss_fn, epochs=10, og_window_size=0, save_path=None):
+    """
+    Trains the model using data from the custom dataloader.
 
-        # The outputs from attention are directly related to masked action positions
-        predictions = self.output_layer(attn_output)
+    Args:
+        model (nn.Module): The model to be trained.
+        custom_dataloader (CustomDataLoader): The custom data loader providing the training data.
+        optimizer (torch.optim.Optimizer): The optimizer used for training.
+        action_loss_fn (nn.Module): Loss function for action predictions.
+        state_loss_fn (nn.Module): Loss function for state predictions.
+        epochs (int, optional): Number of epochs to train for. Default is 10.
+        og_window_size (int, optional): Original window size for the moving window approach. Default is 0.
+        save_path (str, optional): Path to save the model. Default is None.
 
-        return predictions
-    
+    Returns:
+        tuple: Contains two lists, metrics and steps, representing training metrics and corresponding steps.
+    """
+    writer = SummaryWriter()  # Initialize TensorBoard writer
+    metrics = {'accuracy': [], 'forward_loss': [], 'inverse_loss': []}
+    steps = []
 
-class ForwardDynamicHead(nn.Module):
-    def __init__(self, embed_dim, output_dim, num_heads):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
-        self.output_layer = nn.Linear(embed_dim, output_dim)
+    scheduler = StepLR(optimizer, step_size=10, gamma=0.1)  # Step learning rate scheduler to reduce learning rate after 10 epochs
+    model.train()  # Set model to training mode
 
-    def forward(self, x, context_indices, target_index):
-        # Assume x has already been transposed appropriately before calling
-        # x should be [seq_length, batch_size, embed_dim], seq_length should be 3 in this case
+    # To store metrics for the last 500 steps for more stable average calculation
+    last_500_accuracies = []
+    last_500_forward_losses = []
+    last_500_inverse_losses = []
 
-        # Apply attention where the last position is the target, and the first two are context
-        target = x[target_index, :].unsqueeze(0)  # Add seq_len dimension back
-        context = x[context_indices, :]
+    for epoch in range(epochs):
+        total_batches = 0  # Track the total number of batches processed
 
-        # Attention operation
-        attn_output, _ = self.attention(target, context, context)
+        # Iterate through all files provided by the custom data loader
+        for file_index in tqdm(range(len(custom_dataloader.file_names)), desc=f"Epoch {epoch+1}/{epochs}"):
+            states, actions = custom_dataloader.get_next_file()
 
-        # Output processing
-        predictions = self.output_layer(attn_output.squeeze(0))  # Remove seq_len dimension for linear layer
+            # Iterate through all agents in the current file
+            for agent_index in states:
+                state_data = torch.tensor(states[agent_index], dtype=torch.float32).unsqueeze(0)
+                action_data = torch.tensor(actions[agent_index], dtype=torch.long).unsqueeze(0).unsqueeze(-1)
 
-        return predictions
+                # Determine the window size for the moving window approach
+                window_size = og_window_size if og_window_size == 0 or og_window_size > action_data.shape[1] else action_data.shape[1]
 
-    
-class InverseDynamicHead(nn.Module):
-    def __init__(self, embed_dim, output_dim, num_heads):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
-        self.output_layer = nn.Linear(embed_dim, output_dim)
+                # Apply the moving window approach to each agent's data
+                for m in range(0, action_data.shape[1]):
+                    if m + window_size + 1 > state_data.shape[1] or m + window_size > action_data.shape[1]:
+                        break
 
-    def forward(self, x, context_indices, target_index):
-        # Assume x has already been transposed appropriately before calling
-        # x should be [seq_length, batch_size, embed_dim], seq_length should be 3 in this case
+                    # Extract batches for the current window
+                    state_batch = state_data[:, m:m + window_size + 1, :]
+                    action_batch = action_data[:, m:m + window_size, :]
 
-        # Apply attention where the last position is the target, and the first two are context
-        target = x[target_index, :].unsqueeze(0)  # Add seq_len dimension back
-        context = x[context_indices, :]
+                    # Zero the parameter gradients
+                    optimizer.zero_grad()
+                    outputs = model(state_batch, action_batch)
 
-        # Attention operation
-        attn_output, _ = self.attention(target, context, context)
+                    # Unpack model outputs
+                    action_predictions, forward_predictions, inverse_predictions, *_ = outputs
 
-        # Output processing
-        predictions = self.output_layer(attn_output.squeeze(0))  # Remove seq_len dimension for linear layer
+                    # Calculate losses
+                    action_targets = action_batch[:, -1].view(-1).long()
+                    action_loss = action_loss_fn(action_predictions, action_targets)
 
-        return predictions
+                    forward_targets = state_batch[:, 1:, :].transpose(0, 1).float()
+                    forward_loss = state_loss_fn(forward_predictions, forward_targets)
 
+                    inverse_targets = action_batch[:, :-1].view(-1)
+                    inverse_loss = action_loss_fn(inverse_predictions.view(-1, inverse_predictions.size(-1)), inverse_targets)
 
-class TransformerPredictor(nn.Module):
-    def __init__(self, state_embed_dim, state_dim, action_dim, num_heads, num_layers):
-        super().__init__()
-        self.embedding = StateActionEmbedding(state_dim=state_dim, action_dim=action_dim, embed_dim=state_embed_dim)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=state_embed_dim, nhead=num_heads),
-            num_layers=num_layers
-        )
-        self.output_layer = nn.Linear(state_embed_dim, action_dim)
-        #self.dynamic_prediction = nn.Linear(state_embed_dim * 2, state_dim)
-        #self.inverse_prediction = nn.Linear(state_embed_dim * 2, action_dim)
-        self.forward_dynamic_head = ForwardDynamicHead(state_embed_dim, state_dim, num_heads)
-        self.inverse_dynamic_head = InverseDynamicHead(state_embed_dim, action_dim, num_heads)
-        self.masked_action_head = MaskedActionPredictionHead(state_embed_dim, action_dim, num_heads)
+                    # Total loss
+                    total_batch_loss = action_loss + forward_loss + inverse_loss
+                    total_batch_loss.backward()  # Backward pass
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+                    optimizer.step()  # Update model parameters
 
-    def forward(self, states, actions):
-        mask_indices_states, mask_indices_actions = self.random_mask(states, actions)
-        seq_length = states.shape[1]
-        embed = torch.zeros(states.shape[0], seq_length*2, state_embed_dim, device=states.device)
+                    # Calculate action prediction accuracy
+                    action_accuracy = (action_predictions.argmax(dim=-1).view(-1) == action_targets).float().mean().item() * 100
 
-        for i in range(seq_length):
-            embed[:, i*2, :] = self.embedding.forward_state(states[:, i, :])
-            embed[:, i*2+1, :] = self.embedding.forward_action(actions[:, i, :])
+                    # Append metrics for the last 500 steps
+                    last_500_accuracies.append(action_accuracy)
+                    last_500_forward_losses.append(forward_loss.item())
+                    last_500_inverse_losses.append(inverse_loss.item())
 
-        transformer_output = self.transformer(embed)
-        
-        action_prediction = self.output_layer(transformer_output[:, -1, :])  # Example for last action
-        #forward_prediction = self.dynamic_prediction(torch.cat((transformer_output[:, -2, :], transformer_output[:, -1, :]), dim=-1))
-        #inverse_prediction = self.inverse_prediction(torch.cat((transformer_output[:, -2, :], transformer_output[:, 0, :]), dim=-1))
+                    # Maintain only the last 500 entries for each metric
+                    if len(last_500_accuracies) > 500:
+                        last_500_accuracies.pop(0)
+                        last_500_forward_losses.pop(0)
+                        last_500_inverse_losses.pop(0)
 
-        Dynamic_forward_predictions = torch.zeros(states.shape[1]-1, states.shape[0], state_dim, device=states.device)
-        Dynamic_inverse_predictions = torch.zeros(states.shape[1]-1, states.shape[0], action_dim, device=states.device)
-        counter = 0 
-        for i in range(2, seq_length*2, 2):
-            embed_slice = embed[:, [i-2, i-1, i], :].transpose(0, 1)  # Transpose to [3, batch_size, embed_dim]
-            Dynamic_forward_predictions[counter] = self.forward_dynamic_head(embed_slice, [0, 1], 2)
-            counter += 1
+                    total_batches += 1
 
-        counter = 0
-        for i in range(2, seq_length*2, 2):
-            embed_slice = embed[:, [i-2, i-1, i], :].transpose(0, 1)  # Transpose to [3, batch_size, embed_dim]
-            counter += 1
+                    # Print and log metrics every 500 steps
+                    if total_batches % 500 == 0:
+                        avg_accuracy = sum(last_500_accuracies) / len(last_500_accuracies)
+                        avg_forward_loss = sum(last_500_forward_losses) / len(last_500_forward_losses)
+                        avg_inverse_loss = sum(last_500_inverse_losses) / len(last_500_inverse_losses)
 
+                        metrics['accuracy'].append(avg_accuracy)
+                        metrics['forward_loss'].append(avg_forward_loss)
+                        metrics['inverse_loss'].append(avg_inverse_loss)
+                        steps.append(total_batches)
 
+                        # Log metrics to TensorBoard
+                        writer.add_scalar('Accuracy/train', avg_accuracy, total_batches)
+                        writer.add_scalar('Forward Loss/train', avg_forward_loss, total_batches)
+                        writer.add_scalar('Inverse Loss/train', avg_inverse_loss, total_batches)
+                        
+                        tqdm.write(f"Step {total_batches}, Accuracy: {avg_accuracy:.4f}%, Total Loss: {total_batch_loss:.4f}, Forward Loss: {avg_forward_loss:.4f}, Inverse Loss: {avg_inverse_loss:.4f}")
 
-        # Calculate indices for actions and concatenate with state indices
+                        # Save model checkpoint
+                        if save_path:
+                            torch.save(model.state_dict(), f"{save_path}/smart_transformer.pth")
+                            print(f"The model has been saved to path: {save_path}/smart_transformer.pth")
 
+        scheduler.step()  # Step the learning rate scheduler
 
-        combined_indices = torch.cat((mask_indices_states, (mask_indices_actions * 2) + 1), dim=0)
-
-        unmasked = [i for i in range(0, len(embed)) if i not in combined_indices]
-
-        # Use these indices to select the corresponding embeddings
-        masked_action_predictions = self.masked_action_head(embed, unmasked, (mask_indices_actions * 2) + 1)
-
-        return action_prediction, Dynamic_forward_predictions, Dynamic_inverse_predictions, masked_action_predictions, mask_indices_states, mask_indices_actions
-
-    def random_mask(self, states, actions):
-        seq_length = states.shape[1]
-        mask_size_states = seq_length // 2 + 1
-        mask_size_actions = seq_length // 2 - 1
-
-        mask_indices_states = torch.randperm(seq_length)[:mask_size_states]
-        mask_indices_actions = torch.randperm(seq_length)[:mask_size_actions]
-
-        return mask_indices_states, mask_indices_actions
-
-    def random_mask(self, states, actions):
-        seq_length = states.shape[1]
-        mask_size_states = seq_length // 2 + 1
-        mask_size_actions = seq_length // 2 - 1
-
-        mask_indices_states = torch.randperm(seq_length)[:mask_size_states]
-        mask_indices_actions = torch.randperm(seq_length)[:mask_size_actions]
-
-        return mask_indices_states, mask_indices_actions
-
-    def random_mask(self, states, actions):
-        seq_length = states.shape[1]
-        mask_size_states = seq_length // 2 + 1
-        mask_size_actions = seq_length // 2 - 1
-
-        mask_indices_states = torch.randperm(seq_length)[:mask_size_states]
-        mask_indices_actions = torch.randperm(seq_length)[:mask_size_actions]
-
-        return mask_indices_states, mask_indices_actions
+    writer.close()  # Close the TensorBoard writer
+    return metrics, steps
 
 
-def train_model(model, dataloader, optimizer, loss_fn, epochs=10, save_path=None):
-    model.train()
-    for epoch in tqdm(range(epochs), desc="Epochs"):
-        total_loss = 0
-        for i, (state_batch, action_batch) in enumerate(dataloader):
-            optimizer.zero_grad()
-            action_predictions, forward_predictions, inverse_predictions, masked_action_predictions, mask_indices_states, mask_indices_actions = model(state_batch, action_batch)
+# Define folder path and data loader
+folder_path = 'log_data_episodes'
+custom_dataloader = CustomDataLoader(folder_path)
 
-            action_targets = action_batch[:, -1, :]
-            action_loss = loss_fn(action_predictions, action_targets)
-
-            forward_targets = state_batch[:,:-1:,].transpose(0, 1)     
-            forward_loss = loss_fn(forward_predictions, forward_targets)
-
-            inverse_targets = action_batch[:, :-1, :].transpose(0, 1) 
-            inverse_loss = loss_fn(inverse_predictions, inverse_targets)
-            
-            # Gather using created indices
-            masked_action_targets = action_batch[:,mask_indices_actions,:]
-
-            masked_action_loss = loss_fn(masked_action_predictions, masked_action_targets)
-
-            total_batch_loss = action_loss + forward_loss + inverse_loss + masked_action_loss
-            total_batch_loss.backward()
-            optimizer.step()
-
-            total_loss += total_batch_loss.item()
-
-        print(f"Epoch {epoch+1}/{epochs}, Total Loss: {total_loss:.4f}")
-
-        if save_path:
-            torch.save(model.state_dict(), save_path)
-
-
-
+# Model hyperparameters
 state_embed_dim = 20
-action_embed_dim = 20
-state_dim = 60
-action_dim = 10
-seq_length =  100  # Arbitrary sequence length
-batch_size = 32  # Define the batch size for DataLoader
-num_samples = 1000  # Number of samples in the dataset
+state_dim = 2  # Example number of state dimensions
+action_dim = 1  # Example number of action dimensions
 num_heads = 2
 num_layers = 2
+num_action_classes = 5
 
-# Example initialization and usage
-model = TransformerPredictor(state_embed_dim=state_embed_dim, state_dim=state_dim, action_dim=action_dim, num_heads=num_heads, num_layers=num_layers)
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-loss_fn = torch.nn.MSELoss()
+# Initialize model, optimizer, and loss functions
+model = TransformerPredictor(
+    state_embed_dim=state_embed_dim,
+    state_dim=state_dim,
+    action_dim=action_dim,
+    num_action_classes=num_action_classes,
+    num_heads=num_heads,
+    num_layers=num_layers
+)
 
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+action_loss_fn = nn.CrossEntropyLoss()
+state_loss_fn = nn.MSELoss()
 
-# Generate random data for states, actions, and target actions
-states = torch.randn(num_samples, seq_length, state_dim)
-actions = torch.randn(num_samples, seq_length, action_dim)
+# Train the model and capture metrics
+metrics, steps = train_model(
+    model,
+    custom_dataloader,
+    optimizer,
+    action_loss_fn,
+    state_loss_fn,
+    epochs=10,
+    og_window_size=0,
+    save_path='saved_models/'
+)
 
-# Create TensorDataset
-dataset = TensorDataset(states, actions)
-
-# Create DataLoader
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-# Assuming dataset and DataLoader setup here
-train_model(model, dataloader, optimizer, loss_fn, epochs=10, save_path='model_checkpoint.pth')
-
-# Use torchviz to create a dot graph of the model.
-states = torch.randn(num_samples, 25, state_dim)
-actions = torch.randn(num_samples, 25, action_dim)
-output = model(states, actions)
+print(metrics)
