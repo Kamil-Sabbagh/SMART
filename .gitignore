@@ -1,5 +1,4 @@
-# Ignore virtual environment
 venv/
-
-# Ignore log data episodes
 log_data_episodes/
+__pycache__/
+saved_models

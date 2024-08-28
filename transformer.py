@@ -5,7 +5,6 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import os
-
 from data_reader import DataLoader as CustomDataLoader
 from model import TransformerPredictor
 
@@ -50,7 +49,7 @@ def plot_metrics(metrics, steps, save_path='plots'):
     plt.savefig(f'{save_path}/metrics_step_{steps[-1]}.png')
     plt.close()
 
-def train_model(model, custom_dataloader, optimizer, action_loss_fn, state_loss_fn, epochs=10, og_window_size=0, save_path=None):
+def train_model(model, custom_dataloader, optimizer, action_loss_fn, state_loss_fn, epochs=10, og_window_size=5, save_path=None):
     """
     Trains the model using data from the custom dataloader.
 
@@ -87,20 +86,19 @@ def train_model(model, custom_dataloader, optimizer, action_loss_fn, state_loss_
             states, actions = custom_dataloader.get_next_file()
 
             # Iterate through all agents in the current file
-            for agent_index in states:
+            for agent_index in range(len(states)):
                 state_data = torch.tensor(states[agent_index], dtype=torch.float32).unsqueeze(0)
                 action_data = torch.tensor(actions[agent_index], dtype=torch.long).unsqueeze(0).unsqueeze(-1)
-
                 # Determine the window size for the moving window approach
-                window_size = og_window_size if og_window_size == 0 or og_window_size > action_data.shape[1] else action_data.shape[1]
+                window_size = action_data.shape[1] if og_window_size == 0 or og_window_size > action_data.shape[1] else og_window_size
 
                 # Apply the moving window approach to each agent's data
                 for m in range(0, action_data.shape[1]):
-                    if m + window_size + 1 > state_data.shape[1] or m + window_size > action_data.shape[1]:
+                    if m + window_size  > state_data.shape[1] or m + window_size > action_data.shape[1]:
                         break
 
                     # Extract batches for the current window
-                    state_batch = state_data[:, m:m + window_size + 1, :]
+                    state_batch = state_data[:, m:m + window_size, :]
                     action_batch = action_data[:, m:m + window_size, :]
 
                     # Zero the parameter gradients
@@ -205,7 +203,7 @@ metrics, steps = train_model(
     action_loss_fn,
     state_loss_fn,
     epochs=10,
-    og_window_size=0,
+    og_window_size=5,
     save_path='saved_models/'
 )
 

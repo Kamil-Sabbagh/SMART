@@ -59,7 +59,6 @@ class StateActionEmbedding(nn.Module):
 
     def forward_action(self, action):
         return self.action_embedding(action.float())  # Convert action to float
-
 class ForwardDynamicHead(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.1):
         super().__init__()
@@ -69,13 +68,17 @@ class ForwardDynamicHead(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, context_indices, target_index):
-        target = x[target_index, :].unsqueeze(0)
-        context = x[context_indices, :]
+        # Ensure the tensors have the correct shape: [sequence_length, batch_size, embed_dim]
+        target = x[:, target_index, :].unsqueeze(0)  # Shape: [1, batch_size, embed_dim]
+        context = x[:, context_indices, :].transpose(0, 1)  # Shape: [num_context_items, batch_size, embed_dim]
+        
         attn_output, _ = self.attention(target, context, context)
         attn_output = self.dropout(attn_output)
-        predictions = self.output_layer(attn_output.squeeze(0))
+        predictions = self.output_layer(attn_output.squeeze(0))  # Remove the sequence length dimension
         predictions = self.sigmoid(predictions) * 9  # Scale output to [0, 9]
         return predictions
+
+
 
 class InverseDynamicHead(nn.Module):
     def __init__(self, embed_dim, num_classes, num_heads, dropout=0.1):
@@ -85,8 +88,8 @@ class InverseDynamicHead(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, context_indices, target_index):
-        target = x[target_index, :].unsqueeze(0)
-        context = x[context_indices, :]
+        target = x[:, target_index, :].unsqueeze(0)  # Shape: [1, batch_size, embed_dim]
+        context = x[:, context_indices, :].transpose(0, 1)  # Shape: [num_context_items, batch_size, embed_dim]
         attn_output, _ = self.attention(target, context, context)
         attn_output = self.dropout(attn_output)
         logits = self.output_layer(attn_output.squeeze(0))
@@ -108,34 +111,34 @@ class TransformerPredictor(nn.Module):
         nn.init.xavier_uniform_(self.output_layer.weight)
 
     def forward(self, states, actions):
-        batch_size, seq_length, _ = actions.size()
-        embed = torch.zeros(batch_size, (seq_length * 2) + 1, self.embedding.state_embedding.out_features, device=states.device)
+        batch_size, seq_length, _ = states.size()
+        embed = torch.zeros(batch_size, (seq_length * 2), self.embedding.state_embedding.out_features, device=states.device)
 
         for i in range(seq_length):
             embed[:, i * 2, :] = self.embedding.forward_state(states[:, i, :])
             embed[:, i * 2 + 1, :] = self.embedding.forward_action(actions[:, i].unsqueeze(1))
-        embed[:, -1, :] = self.embedding.forward_state(states[:, -1, :])
-
+        
         transformer_output = self.transformer(embed)
         logits = self.output_layer(transformer_output[:, -1, :])
         action_prediction = F.softmax(logits, dim=-1)  # Apply softmax to get probabilities
 
-        forward_predictions = torch.zeros(seq_length, batch_size, 2, device=states.device)
-        inverse_predictions = torch.zeros(seq_length - 1, batch_size, num_action_classes, device=states.device)
+        forward_predictions = torch.zeros(batch_size, seq_length - 1 , 2, device=states.device)
+        inverse_predictions = torch.zeros(batch_size, seq_length - 1, num_action_classes, device=states.device)
 
-        for i in range(1, seq_length):
-            embed_slice = embed[:, [(i - 1) * 2, (i - 1) * 2 + 1, i * 2], :].transpose(0, 1)
-            forward_predictions[i - 1] = self.forward_dynamic_head(embed_slice, [0, 1], 2)
-            inverse_predictions[i - 1] = self.inverse_dynamic_head(embed_slice, [0, 1], 2)
+        for i in range(0, seq_length-1):
+            i = i * 2 
+            embed_slice = embed[:,[i,i+1,i+2],:]
+            forward_predictions[:,i//2] = self.forward_dynamic_head(embed_slice, [0, 1], 2)
+            inverse_predictions[:,i//2] = self.inverse_dynamic_head(embed_slice, [0, 2], 1)
 
         # Mask some states and actions
-        unmasked_indices, masked_state_indices, masked_action_indices = self.random_mask(embed, seq_length)
-        masked_state_predictions, masked_action_predictions = self.masked_prediction_head(embed, unmasked_indices, masked_state_indices, masked_action_indices)
+        #unmasked_indices, masked_state_indices, masked_action_indices = self.random_mask(embed, seq_length)
+        #masked_state_predictions, masked_action_predictions = self.masked_prediction_head(embed, unmasked_indices, masked_state_indices, masked_action_indices)
         #combined_mask_indices = torch.cat([mask_indices_states * 2, mask_indices_actions * 2 + 1])
         #unmasked_indices = torch.tensor([i for i in range((seq_length * 2) + 1) if i not in combined_mask_indices], device=states.device)
 
-
-        return action_prediction, forward_predictions, F.softmax(inverse_predictions, dim=-1), masked_state_predictions, masked_action_predictions, unmasked_indices, unmasked_indices
+        return action_prediction, forward_predictions, F.softmax(inverse_predictions, dim=-1)
+        #return action_prediction, forward_predictions, F.softmax(inverse_predictions, dim=-1), masked_state_predictions, masked_action_predictions, unmasked_indices, unmasked_indices
 
     def random_mask(self, x, seq_length):
                 
